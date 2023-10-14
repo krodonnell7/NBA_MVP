@@ -1,0 +1,1645 @@
+---
+title: "ROY"
+author: "Kevin O'Donnell"
+date: '2022-08-28'
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(MASS)
+library(tidyverse)
+library(nbastatR)
+#library(nbaTools)
+#library(NBAloveR)
+#library(ncaahoopR)
+#library(statsnbaR)
+#library(hoopR)
+#library(Hmisc)
+library(corrplot)
+library(reshape2)
+library(ggrepel)
+library(modelr)
+library(knitr)
+library(htmlTable)
+library(stringr)
+#library(pscl)
+#library(boot)
+library(caret)
+#library(smotefamily)
+#library(DMwR2)
+library(ggthemes)
+library(car)
+```
+
+# MVP 
+
+## Data Collection, Merging, and Cleaning
+```{r}
+#MVP
+mvp <- bref_awards(awards = c("Most Valuable Player"))
+mvp <- mvp %>% select(namePlayer, slugSeason) %>% mutate(isMVP = 1)
+mvp$namePlayer <- ifelse(mvp$namePlayer == "Nikola Jokić", "Nikola Jokic", mvp$namePlayer)
+#player_stats <- teams_players_stats(seasons = 2021, types="player", tables=c("general", "defense"), season_types="Regular Season", modes="PerGame", is_pace_adjusted=T, measures="Base")
+
+#award votes and award shares
+voting <- read.csv("mvp_votings.csv")
+voting <- voting %>% select(player, season, award_share)
+
+#advanced and per game stats
+player_stats <- bref_players_stats(seasons = 1954:2022, tables = c("advanced", "per_game"))
+player_stats <- player_stats %>% group_by(namePlayer, slugSeason) %>% slice(1)
+
+#combining mvp (Y/N) with player_stats
+mvp_player_stats <- left_join(player_stats, voting, by=c("namePlayer"="player", "slugSeason"="season"))
+mvp_player_stats <- mvp_player_stats %>% mutate(award_share = ifelse(is.na(award_share), 0, award_share))
+
+mvp_player_stats2 <- left_join(mvp_player_stats, mvp, by=c("namePlayer", "slugSeason"))
+mvp_player_stats2 <- mvp_player_stats2 %>% mutate(isMVP = ifelse(is.na(isMVP), 0, 1))
+
+#what draft pick they were
+#need more identifiers to prevent duplicates
+drafts <- drafts(draft_years = 1952:2021, nest_data = FALSE, return_message = TRUE)
+drafts <- drafts %>% select(namePlayer, numberPickOverall, idPlayer)
+
+#duplicate players for some reason - find out how to filter for correct draft pick (not always first or last)
+#might have to do manual
+dups <- drafts %>% arrange(idPlayer) %>% group_by(idPlayer) %>% filter(n()>1)
+dup_ids <- as.character(unique(dups$idPlayer))
+dup_names <- as.character(unique(dups$namePlayer))
+
+full_draft <- read.csv("NBA_Full_Draft_1947-2018.csv")
+full_draft <- full_draft %>% select(Player, Year, Pick)
+#filter for only names in dup_names vector
+full_draft <- full_draft %>% filter(Player %in% dup_names)
+draft_corrections <- left_join(dups, full_draft, by=c("namePlayer"="Player"))
+draft_corrections <- draft_corrections %>% 
+  group_by(namePlayer) %>% 
+  filter(Year == max(Year)) %>%
+  filter(!duplicated(namePlayer)) %>%
+  select(namePlayer, Pick)
+
+drafts2 <- left_join(drafts, draft_corrections, by="namePlayer")
+drafts2 <- drafts2 %>% mutate(numberPickOverall = ifelse(is.na(Pick), numberPickOverall, Pick)) %>%
+  unique() %>%
+  select(-Pick)
+
+
+player_stats_draft_pick <- left_join(mvp_player_stats2, drafts2, by=c("idPlayerNBA"="idPlayer", "namePlayer"))
+
+#physical attributes
+attributes <- read.csv("Players.csv")
+attributes <- attributes[2:4]
+attributes$Player <- str_replace(attributes$Player, '\\*', '')
+
+#adding attirbutes to main data
+full_player_stats <- left_join(player_stats_draft_pick, attributes, by=c("namePlayer"="Player"))
+
+#checking for duplicates
+nrow(full_player_stats %>% filter(yearSeason>1980) %>% group_by(namePlayer, yearSeason) %>% filter(n()>1))
+
+#prior MVPs variables
+full_player_stats <- full_player_stats %>% 
+  group_by(namePlayer) %>% 
+  arrange(yearSeason) %>% 
+  mutate(totalMVP = cumsum(isMVP))
+
+#removing unnecessary variables 
+full_player_stats_clean <- full_player_stats %>% select(c("slugSeason", "namePlayer", "groupPosition", "yearSeason", 
+"slugPosition", "agePlayer", "slugTeamBREF", "countGames", "slugTeamsBREF", "ratioPER", 
+"pctTrueShooting", "pct3PRate", "pctFTRate", "pctORB", "pctDRB", 
+"pctTRB", "pctAST", "pctSTL", "pctBLK", "pctTOV", "pctUSG", "ratioOWS", 
+"ratioDWS", "ratioWS", "ratioWSPer48", "ratioOBPM", "ratioDBPM", 
+"ratioBPM", "ratioVORP", "countGamesStarted", 
+"pctFG", "pctFG3", "pctFG2", "pctEFG", "pctFT", "minutesPerGame", 
+"fgmPerGame", "fgaPerGame", "fg3mPerGame", "fg3aPerGame", "fg2mPerGame", 
+"fg2aPerGame", "ftmPerGame", "ftaPerGame", "orbPerGame", "drbPerGame", 
+"trbPerGame", "astPerGame", "stlPerGame", "blkPerGame", "tovPerGame", 
+"pfPerGame", "ptsPerGame", "numberPickOverall", "height", "weight", "isMVP", "totalMVP", "award_share"))
+
+#lagging stats to use their previous year's stats, not their current year, so I can predict before season starts
+lagged_stats <- full_player_stats_clean %>%
+  group_by(namePlayer) %>%
+  arrange(yearSeason) %>%
+  mutate(award_share_lagged = award_share, across(c("countGames", "ratioPER", 
+"pctTrueShooting", "pct3PRate", "pctFTRate", "pctORB", "pctDRB", 
+"pctTRB", "pctAST", "pctSTL", "pctBLK", "pctTOV", "pctUSG", "ratioOWS", 
+"ratioDWS", "ratioWS", "ratioWSPer48", "ratioOBPM", "ratioDBPM", 
+"ratioBPM", "ratioVORP", "countGamesStarted", 
+"pctFG", "pctFG3", "pctFG2", "pctEFG", "pctFT", "minutesPerGame", 
+"fgmPerGame", "fgaPerGame", "fg3mPerGame", "fg3aPerGame", "fg2mPerGame", 
+"fg2aPerGame", "ftmPerGame", "ftaPerGame", "orbPerGame", "drbPerGame", 
+"trbPerGame", "astPerGame", "stlPerGame", "blkPerGame", "tovPerGame", 
+"pfPerGame", "ptsPerGame", "isMVP", "totalMVP", "award_share_lagged"), ~ lag(x=.x, n=1)))
+
+full_player_stats_clean %>% filter(namePlayer == "LeBron James")
+lagged_stats %>% filter(namePlayer == "LeBron James")
+
+team_stats <- data.frame()
+for (i in 1980:2022) {
+  df <- bref_teams_stats(seasons = i, assign_to_environment = F)
+  df <- df[[2]][[1]]
+  df <- df %>% select(slugSeason, yearSeason, slugTeamBREF, pctWins, ptsPerGameTeam, astPerGameTeam, drbPerGameTeam, tovPerGameTeam, pctFGPerGameTeam, pctFTPerGameTeam)
+  team_stats <- rbind(team_stats, df)
+}
+
+#mess with year variable to allign player stats with team stats from prior year
+team_stats <- team_stats %>% mutate(year = as.numeric(substr(slugSeason, 1, 4))+1, merge_year = year+1)
+
+lagged_stats <- left_join(lagged_stats, team_stats, by=c("yearSeason"="merge_year", "slugTeamBREF"))
+
+lagged_stats %>% filter(namePlayer == "LeBron James")
+
+team_player_stats <- left_join(full_player_stats_clean, team_stats, by=c("slugTeamBREF", "yearSeason")) %>%
+  filter(yearSeason > 1980)
+```
+
+# Initial Data Viz
+```{r}
+numeric <- dplyr::select(lagged_stats, where(is.numeric))
+numeric <- numeric[,-1]
+cormat <- cor(numeric, use = "complete.obs")
+melted_cormat <- melt(cormat)
+corrplot(cormat)
+#correlation matrix (colorful)
+ggplot(melted_cormat, aes(Var1, Var2, fill=value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))
+
+# Correlation matrix (1/3)
+melted_cormat <- melted_cormat %>% arrange(Var1)
+
+melted_cormat1 <- melted_cormat %>% filter(Var1 %in% c("yearSeason", "agePlayer", "countGames", 
+"ratioPER", "pctTrueShooting", "pct3PRate", "pctFTRate", "pctORB", 
+"pctDRB", "pctTRB", "pctAST", "pctSTL", "pctBLK", "pctTOV", "pctUSG", 
+"ratioOWS", "ratioDWS", "ratioWS", "ratioWSPer48", "ratioOBPM"), Var2 %in% c("yearSeason", "agePlayer", "countGames", 
+"ratioPER", "pctTrueShooting", "pct3PRate", "pctFTRate", "pctORB", 
+"pctDRB", "pctTRB", "pctAST", "pctSTL", "pctBLK", "pctTOV", "pctUSG", 
+"ratioOWS", "ratioDWS", "ratioWS", "ratioWSPer48", "ratioOBPM"))
+
+melted_cormat2 <- melted_cormat %>% filter(Var1 %in% c("ratioDBPM", "ratioBPM", "ratioVORP", "countGamesStarted", "pctFG", "pctFG3", "pctFG2", "pctEFG", "pctFT", "minutesPerGame", "fgmPerGame", 
+"fgaPerGame", "fg3mPerGame", "fg3aPerGame", "fg2mPerGame", "fg2aPerGame", 
+"ftmPerGame", "ftaPerGame", "orbPerGame", "drbPerGame") , Var2 %in% c("ratioDBPM", "ratioBPM", "ratioVORP", "countGamesStarted", "pctFG", 
+"pctFG3", "pctFG2", "pctEFG", "pctFT", "minutesPerGame", "fgmPerGame", "fgaPerGame", "fg3mPerGame", "fg3aPerGame","fg2mPerGame", "fg2aPerGame", "ftmPerGame", "ftaPerGame", "orbPerGame", "drbPerGame"))
+
+melted_cormat3 <- melted_cormat %>% filter(Var1 %in% c("trbPerGame", "astPerGame", "stlPerGame", "blkPerGame", "tovPerGame", "pfPerGame", "ptsPerGame", "numberPickOverall", "height", "weight", "isMVP", "totalMVP", "yearSeason.y", "pctWins", "ptsPerGameTeam", "astPerGameTeam", "drbPerGameTeam", "tovPerGameTeam", "pctFGPerGameTeam", "pctFTPerGameTeam", 
+"year") , Var2 %in% c("trbPerGame", "astPerGame", "stlPerGame", "blkPerGame", "tovPerGame", "pfPerGame", "ptsPerGame", "numberPickOverall", "height", "weight", "isMVP", "totalMVP", "yearSeason.y", "pctWins", "ptsPerGameTeam", "astPerGameTeam", "drbPerGameTeam", "tovPerGameTeam", "pctFGPerGameTeam", "pctFTPerGameTeam", 
+"year"))
+
+ggplot(melted_cormat1, aes(Var1, Var2, fill=value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1)) +
+  labs(title = "Correlations between Numeric Variables (Pt. 1)", x="Variable 1", y= "Variable 2") +
+  theme(plot.title = element_text(hjust = 0.5, color = "salmon"))
+
+
+ggplot(melted_cormat2, aes(Var1, Var2, fill=value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+  labs(title = "Correlations between Numeric Variables (Pt. 2)", x="Variable 1", y= "Variable 2") +
+  theme(plot.title = element_text(hjust = 0.5, color = "salmon"))
+
+
+ggplot(melted_cormat3, aes(Var1, Var2, fill=value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+  labs(title = "Correlations between Numeric Variables (Pt. 3)", x="Variable 1", y= "Variable 2") +
+  theme(plot.title = element_text(hjust = 0.5, color = "salmon"))
+
+#histograms of all numeric vars
+hist.data.frame(numeric)
+
+#percentage of values missing for each column
+colSums(is.na(lagged_stats))/nrow(lagged_stats) 
+
+#ugly plot but supposed to be every variable related to isMVP
+gathered <- lagged_stats %>% gather(key= "variable", value = "value", -isMVP)
+ggplot(gathered, aes(x = value, y = isMVP)) +
+  geom_point() +
+  facet_wrap(~variable)
+
+lagged_stats %>% group_by(isMVP) %>%
+  summarise(mean(agePlayer))
+
+mvps <- full_player_stats_clean %>% filter(isMVP ==1)
+bums <- full_player_stats_clean %>% filter(isMVP ==0)
+
+mvps_1981 <- mvps %>% filter(yearSeason >= 1981)
+bums_1981 <- bums %>% filter(yearSeason >= 1981)
+
+#t-tests comparing mvps to non mvps for different stats
+t.test(bums_1981$agePlayer, mvps_1981$agePlayer)
+t.test(bums_1981$ratioPER, mvps_1981$ratioPER)
+t.test(bums_1981$ratioWS, mvps_1981$ratioWS)
+t.test(bums_1981$ptsPerGame, mvps_1981$ptsPerGame)
+t.test(bums_1981$astPerGame, mvps_1981$astPerGame)
+t.test(bums_1981$trbPerGame, mvps_1981$trbPerGame)
+t.test(bums_1981$pctTrueShooting, mvps_1981$pctTrueShooting)
+t.test(bums_1981$height, mvps_1981$height)
+weight_t_test <- t.test(bums_1981$weight, mvps_1981$weight)
+
+numeric_names <- names(dplyr::select(mvps_1981, where(is.numeric)))
+numeric_names <- numeric_names[-c(1,2,52,53,54)]
+
+p_values <- c()
+greater_or_less <- c()
+for (i in 1:49) {
+  x <- bums_1981 %>% select(numeric_names[i])
+  y <- mvps_1981 %>% select(numeric_names[i])
+  p_values[i] <- t.test(x[2], y[2])$p.value
+  greater_or_less[i] <- ifelse(t.test(x[2], y[2])$estimate[2] > t.test(x[2], y[2])$estimate[1], "Greater", "Less")
+}
+p_values <- data.frame(numeric_names, p_values, greater_or_less)
+p_values <- p_values %>% mutate(significant = ifelse(p_values<0.05, "Yes", "No")) %>% arrange(p_values) %>% rename("Variable" = numeric_names, "P-Value" = p_values, "Significant at alpha=0.05?" = significant, "Is Mean for MVPs Greater or Less Than Mean for non-MVPs?" = greater_or_less)
+p_values$`P-Value` <- round(p_values$`P-Value`, 5)
+htmlTable(p_values)
+
+
+#correlations of each variable with award_share
+numeric <- dplyr::select(filter(full_player_stats_clean, yearSeason>1980), where(is.numeric))
+numeric <- numeric %>% select(-yearSeason, -isMVP, -namePlayer)
+numeric <- numeric[,-1]
+
+cors <- c()
+numeric_names <- c()
+y <- numeric %>% select(award_share)
+for (i in 1:50) {
+  x <- numeric[,i]
+  numeric_names[i] <- names(x)
+  cors[i] <- cor(x,y, use="complete.obs")
+}
+cors_df <- data.frame(numeric_names, cors) 
+cors_df <- cors_df %>% arrange(-cors) %>% rename("Variable" = numeric_names, "Correlation with Award Share" = cors)
+cors_df$`Correlation with Award Share` <- round(cors_df$`Correlation with Award Share`, digit = 5)
+htmlTable(cors_df)
+
+cor(team_player_stats$award_share, team_player_stats$height, use="complete.obs")
+cor(team_player_stats$award_share, team_player_stats$weight, use="complete.obs")
+
+
+#relationships between variables and isMVP using simple logistic models
+all <- full_player_stats_clean %>% select(-yearSeason, -namePlayer, -yearSeason, -slugTeamsBREF)
+all <- all[,-1]
+
+marginal_p_values <- c()
+all_names <- c()
+y <- all$isMVP
+all <- all %>% select(-isMVP)
+for (i in 1:55) {
+  x <- all[,i]
+  total <- cbind(y, x)
+  all_names[i] <- names(x)
+  marginal_p_values[i] <- summary(glm(y ~ ., data = total, family = "gaussian"))$coefficients[2,4]
+}
+marginal_p_values_df <- data.frame(all_names, marginal_p_values) %>% 
+  arrange(marginal_p_values) %>%
+  mutate(significant = ifelse(marginal_p_values<0.05, "Yes", "No")) %>%
+  rename("Variable" = all_names, "P-Value" = marginal_p_values, "Significant Marginal Relationship at alpha=0.05?" = significant)
+marginal_p_values_df <- marginal_p_values_df[-55,]
+marginal_p_values_df$`P-Value` <- round(marginal_p_values_df$`P-Value`, 5)
+htmlTable(marginal_p_values_df)
+
+summary(glm(isMVP ~ pctWins, data = team_player_stats, family = "gaussian"))$coefficients[2,4]
+summary(glm(isMVP ~ ptsPerGameTeam, data = team_player_stats, family = "gaussian"))$coefficients[2,4]
+summary(glm(isMVP ~ astPerGameTeam, data = team_player_stats, family = "gaussian"))$coefficients[2,4]
+summary(glm(isMVP ~ drbPerGameTeam, data = team_player_stats, family = "gaussian"))$coefficients[2,4]
+summary(glm(isMVP ~ tovPerGameTeam, data = team_player_stats, family = "gaussian"))$coefficients[2,4]
+summary(glm(isMVP ~ pctFGPerGameTeam, data = team_player_stats, family = "gaussian"))$coefficients[2,4]
+summary(glm(isMVP ~ pctFTPerGameTeam, data = team_player_stats, family = "gaussian"))$coefficients[2,4]
+
+
+#relationships between categorical variables and award_share / isMVP
+categorical <- dplyr::select(filter(full_player_stats_clean, yearSeason>1980), where(is.character))
+chisq.test(full_player_stats_clean$groupPosition, as.factor(full_player_stats_clean$isMVP))
+full_player_stats_clean %>% group_by(groupPosition) %>% summarise(sum(isMVP))
+chisq.test(full_player_stats_clean$slugPosition, as.factor(full_player_stats_clean$isMVP))
+full_player_stats_clean %>% group_by(slugPosition) %>% summarise(sum(isMVP))
+
+summary(aov(award_share ~ groupPosition, data=lagged_stats_model_likely))
+summary(aov(award_share ~ slugPosition, data=lagged_stats_model_likely))
+
+
+#MVPs by draft position
+full_player_stats %>% filter(isMVP==1) %>% select(numberPickOverall)
+
+#mvps by position
+ggplot(mvps, aes(x=slugPosition)) +
+  geom_bar() +
+  labs(title = "MVPs by Position Since 1955")
+
+mvps <- mvps %>% mutate(decade = paste0(as.character(yearSeason - yearSeason %% 10), "s"))
+mvps_1981 <- mvps_1981 %>% mutate(decade = paste0(as.character(yearSeason - yearSeason %% 10), "s"))
+ggplot(mvps_1981, aes(x=fct_relevel(slugPosition, "PG", "SG", "SF", "PF", "C"), fill=decade)) +
+  geom_bar() +
+  labs(title = "MVPs by Position Since 1980", x="Position", y="Number of MVPs", subtitle = "Segmented by Decade") +
+  theme(plot.title = element_text(hjust = 0.5, color = "Purple"), plot.subtitle = element_text(hjust = 0.5, color = "Salmon")) +
+  guides(fill=guide_legend(title="Decade"))
+
+
+#DWS to OWS for MVPs (and maybe all just highlight MVPs)
+lagged_stats_plot <- lagged_stats %>% mutate(factor = as.factor(ifelse(isMVP==1, "Yes", "No")))
+full_player_stats_clean_plot <- full_player_stats_clean %>% 
+  mutate(factor = as.factor(ifelse(isMVP==1, "Yes", "No"))) %>% 
+  filter(yearSeason > 1980)
+
+quantile(full_player_stats_clean_plot$ratioOWS, probs = 1-.1/100)
+quantile(full_player_stats_clean_plot$ratioDWS, probs = 1-.1/100)
+
+nrow(full_player_stats_clean_plot %>% filter(ratioOWS > 13.1988))
+nrow(full_player_stats_clean_plot %>% filter(ratioDWS > 7.1988))
+
+highlighted <- full_player_stats_clean_plot %>% filter(ratioOWS > 13.1988 | ratioDWS > 7.1988)
+highlighted %>% filter(ratioOWS > 13.1988, isMVP==1)
+highlighted %>% filter(ratioDWS > 7.1988, isMVP==1)
+
+ggplot(full_player_stats_clean_plot, aes(x=ratioDWS, y=ratioOWS, color=factor)) +
+  geom_point() +
+  #geom_label_repel(data = filter(full_player_stats_clean_plot, (ratioOWS>14 | ratioDWS>8)), aes(label=namePlayer), point.padding = unit(0.5, "lines"), box.padding = unit(0.5, "lines"), size=3) +
+  labs(title = "Players Offensive Win Shares vs Their Defensive Win Shares", x="DWS", y="OWS", subtitle = "Since the 1980-81 Season") +
+  theme(plot.title = element_text(hjust = 0.5, color = "salmon"), plot.subtitle = element_text(hjust = 0.5, color = "#00BFC4")) +
+  guides(color=guide_legend(title="MVP?")) +
+  #geom_hline(yintercept=(quantile(full_player_stats_clean_plot$ratioOWS, probs = 1-.1/100)), color="grey") +
+  #geom_vline(xintercept=(quantile(full_player_stats_clean_plot$ratioDWS, probs = 1-.1/100)), color="grey") +
+  geom_point(data = highlighted, aes(x=ratioDWS, y=ratioOWS, color=factor), size=2.75, pch=21)
+  
+
+
+#FTM vs FTA
+quantile(full_player_stats_clean_plot$ftmPerGame / full_player_stats_clean_plot$ftaPerGame, na.rm = T, probs = .75)
+quantile(full_player_stats_clean_plot$ftaPerGame, probs =.75)
+filter(full_player_stats_clean_plot, isMVP == 1, pctFT > 0.8181818)
+filter(full_player_stats_clean_plot, isMVP == 1, ftaPerGame > 2.9)
+
+ggplot(full_player_stats_clean_plot %>% arrange(factor), aes(x=ftaPerGame, y=ftmPerGame, color=factor)) +
+  geom_point(aes(size=factor)) +
+  scale_size_discrete(range = c(1, 4), guide='none') +
+  #geom_label_repel(data = filter(full_player_stats_clean_plot, (ratioOWS>14 | ratioDWS>8)), aes(label=namePlayer), point.padding = unit(0.5, "lines"), box.padding = unit(0.5, "lines"), size=3) +
+  labs(title = "Players Free Throws Made vs Free Throws Attempted Per Game", x="FTA", y="FTM", subtitle = "Since the 1980-81 Season") +
+  theme(plot.title = element_text(hjust = 0.5, color = "salmon"), plot.subtitle = element_text(hjust = 0.5, color = "#00BFC4"), panel.background = element_rect(fill = "white"), panel.grid.major = element_line(color = "lightgrey")) +
+  guides(color=guide_legend(title="MVP?")) +
+  geom_abline(slope = 0.8181818, color="black") +
+  geom_hline(yintercept=quantile(full_player_stats_clean_plot$ftmPerGame, probs =.75, na.rm = T), color="black") +
+  geom_vline(xintercept=quantile(full_player_stats_clean_plot$ftaPerGame, probs =.75, na.rm = T), color="black") 
+  #geom_point(data = highlighted, aes(x=ratioDWS, y=ratioOWS, color=factor), size=2.75, pch=21)
+
+
+#VORP vs Award Share
+quantile(full_player_stats_clean_plot$ratioVORP, probs =.9985)
+
+
+ggplot(filter(full_player_stats_clean_plot, yearSeason < 2018), aes(x=ratioVORP, y=award_share, color=factor)) +
+  geom_point() +
+  labs(title = "Award Share by VORP", x="VORP", y="Award Share", subtitle = "Since the 1980-81 Season") +
+  theme(plot.title = element_text(hjust = 0.5, color = "salmon"), plot.subtitle = element_text(hjust = 0.5, color = "#00BFC4"), legend.position = c(.9, .4)) +
+  guides(color=guide_legend(title="MVP?")) +
+  geom_label_repel(data = filter(full_player_stats_clean_plot, (ratioVORP < 4.5 & award_share > .5), yearSeason < 2018), aes(label=paste(namePlayer, slugSeason)), point.padding = unit(0.5, "lines"), box.padding = unit(.5, "lines"), size=3, nudge_x = -3, direction = "y") +
+  coord_cartesian(clip = "off") +
+  geom_label_repel(data = filter(full_player_stats_clean_plot, (ratioVORP > 11 | (ratioVORP > 9 & award_share < .25)), yearSeason < 2018), aes(label=paste(namePlayer, slugSeason)), point.padding = unit(0.5, "lines"), box.padding = unit(.5, "lines"), size=3, nudge_x = 2.5, direction = "y", xlim = c(-Inf, Inf), ylim = c(-Inf, Inf)) +
+  expand_limits(x = 16)
+
+
+#BLK% vs TRB%
+ggplot(filter(full_player_stats_clean_plot, minutesPerGame>20), aes(x=pctTRB, y=pctBLK)) +
+  geom_point() +
+  labs(title = "Players Block Percentage (BLK%) vs Total Rebounding Percentage (TRB%)", y="BLK%", x="TRB%", subtitle = "Since the 1980-81 Season") +
+  theme(plot.title = element_text(hjust = 0.5, color = "salmon"), plot.subtitle = element_text(hjust = 0.5, color = "#00BFC4")) +
+  geom_smooth(method="lm")
+
+
+#how many games played do MVPs have?
+ggplot(mvps_1981, aes(x=countGamesStarted)) +
+  geom_histogram()
+
+ggplot(bums_1981, aes(x=countGamesStarted)) +
+  geom_histogram()
+
+#how many minutes do MVPs play?
+ggplot(mvps_1981, aes(x=minutesPerGame)) +
+  geom_histogram()
+
+ggplot(bums_1981, aes(x=minutesPerGame)) +
+  geom_histogram()
+
+ggplot(mvps, aes(agePlayer)) +
+  geom_histogram(binwidth = 1, color="Salmon", fill="black") +
+  labs(title = "Age of MVPs", subtitle = "1954-Present", x="Age", y="Count") +
+  theme(plot.title = element_text(hjust = 0.5, color = "Purple"), plot.subtitle = element_text(hjust = 0.5, color = "Salmon"))
+
+#voting history
+voting %>% distinct(season)
+nrow(voting)/nrow(voting %>% distinct(season))
+```
+
+# Prepping model and modeling next year stats for feature creation 
+```{r}
+lagged_stats$slugPosition <- ifelse(lagged_stats$slugPosition == "C-F", "F-C", lagged_stats$slugPosition)
+
+na_count <-sapply(lagged_stats, function(y) sum(length(which(is.na(y)))))
+na_count <- data.frame(na_count)
+
+filter(lagged_stats, is.na(ptsPerGameTeam) & yearSeason>1981)
+
+lagged_stats_model <- lagged_stats %>% filter(yearSeason>=1981) %>%
+  mutate_at(vars(pctWins:pctFTPerGameTeam),~ifelse(is.na(.x), mean(.x, na.rm = TRUE), .x))
+
+na_count <-sapply(lagged_stats_model, function(y) sum(length(which(is.na(y)))))
+na_count <- data.frame(na_count)
+
+write.csv(lagged_stats_model, "test.csv")
+```
+
+# More data filtering to only include players likely to get MVP
+```{r}
+mean(mvps_1981$minutesPerGame) - 3*sd(mvps_1981$minutesPerGame)
+mean(mvps_1981$countGamesStarted) - 3*sd(mvps_1981$countGamesStarted)
+mean(mvps_1981$countGames) - 3*sd(mvps_1981$countGames)
+
+lagged_stats_model %>% filter(lead(isMVP, 1)==1) %>% filter(lead(minutesPerGame, 1) < mean(mvps_1981$minutesPerGame) - 3*sd(mvps_1981$minutesPerGame) | lead(countGamesStarted, 1) < mean(mvps_1981$countGamesStarted) - 3*sd(mvps_1981$countGamesStarted) | lead(countGames, 1)< mean(mvps_1981$countGames) - 3*sd(mvps_1981$countGames))
+
+#filtering out wrong people - adjust for lag
+#also dependent on mvps dataset which was run in the other markdown file but I haven't changed the code in this one to allow it
+lagged_stats_model_likely2 <- lagged_stats_model %>% 
+  group_by(namePlayer) %>%
+  arrange(yearSeason) %>%
+  filter(lead(minutesPerGame, 1) > (mean(mvps_1981$minutesPerGame) - 3*sd(mvps_1981$minutesPerGame))) %>%
+  filter(lead(countGamesStarted, 1) > (mean(mvps_1981$countGamesStarted) - 3*sd(mvps_1981$countGamesStarted)))#%>%
+  #filter(lead(countGames, 1) > (mean(mvps_1981$countGames) - 3*sd(mvps_1981$countGames)))
+
+na_count <-sapply(lagged_stats_model_likely, function(y) sum(length(which(is.na(y)))))
+na_count <- data.frame(na_count)
+
+lagged_stats_model_likely <- lagged_stats_model_likely %>% filter(!is.na(award_share_lagged))
+
+na_count <-sapply(lagged_stats_model_likely, function(y) sum(length(which(is.na(y)))))
+na_count <- data.frame(na_count)
+
+inner_join(lagged_stats_model_likely, mvps_1981, by=c("namePlayer", "yearSeason"))
+lagged_stats_model %>% filter(namePlayer %in% c("Magic Johnson", "Michael Jordan")) %>% summarise(slugSeason.x, countGames, countGamesStarted, minutesPerGame)
+```
+
+
+# Initial Models
+```{r}
+lagged_stats_model_likely_aws <- lagged_stats_model_likely %>% filter(yearSeason<=2018)
+
+train <- lagged_stats_model_likely_aws %>% filter(yearSeason<=2007)
+test <- lagged_stats_model_likely_aws %>% filter(yearSeason>2007)
+
+#using all data points instead of just likely ones
+lagged_stats_model_aws <- lagged_stats_model %>% filter(yearSeason<=2018)
+
+train <- lagged_stats_model_aws %>% filter(yearSeason<=2008)
+test <- lagged_stats_model_aws %>% filter(yearSeason>2008)
+
+
+full_lm <- lm(award_share ~  factor(groupPosition) + 
+ factor(slugPosition) +  agePlayer +  countGames + 
+ ratioPER  +  pctTrueShooting  +  pct3PRate  +  pctFTRate  +  pctORB  + 
+ pctDRB  +  pctTRB  +  pctAST  +  pctSTL  +  pctBLK  +  pctTOV  +  pctUSG  + 
+ ratioOWS  +  ratioDWS  +  ratioWS  +  ratioWSPer48  +  ratioOBPM  + 
+ ratioDBPM  +  ratioBPM  +  ratioVORP  +  countGamesStarted +  pctFG  + 
+ pctFG3  +  pctFG2  +  pctEFG  +  pctFT  +  minutesPerGame +  fgmPerGame  + 
+ fgaPerGame  +  fg3mPerGame  +  fg3aPerGame  +  fg2mPerGame  +  fg2aPerGame  + 
+ ftmPerGame  +  ftaPerGame  +  orbPerGame  +  drbPerGame  +  trbPerGame  + 
+ astPerGame  +  stlPerGame  +  blkPerGame  +  tovPerGame  +  pfPerGame  + 
+ ptsPerGame + pctWins + ptsPerGameTeam + astPerGameTeam + ptsPerGameTeam + drbPerGameTeam + tovPerGameTeam + pctFGPerGameTeam +  pctFTPerGameTeam + award_share_lagged + isMVP + totalMVP, data = train)
+
+summary(full_lm)
+
+empty_lm <- lm(award_share ~  1, data = na.omit(train))
+
+#backward selection
+stepAIC(full_lm, direction = "backward")
+stepAIC(empty_lm, direction = "forward", scope=list(lower=empty_lm, upper=~factor(groupPosition) + 
+ factor(slugPosition) +  agePlayer +  countGames + 
+ ratioPER  +  pctTrueShooting  +  pct3PRate  +  pctFTRate  +  pctORB  + 
+ pctDRB  +  pctTRB  +  pctAST  +  pctSTL  +  pctBLK  +  pctTOV  +  pctUSG  + 
+ ratioOWS  +  ratioDWS  +  ratioWS  +  ratioWSPer48  +  ratioOBPM  + 
+ ratioDBPM  +  ratioBPM  +  ratioVORP  +  countGamesStarted +  pctFG  + 
+ pctFG3  +  pctFG2  +  pctEFG  +  pctFT  +  minutesPerGame +  fgmPerGame  + 
+ fgaPerGame  +  fg3mPerGame  +  fg3aPerGame  +  fg2mPerGame  +  fg2aPerGame  + 
+ ftmPerGame  +  ftaPerGame  +  orbPerGame  +  drbPerGame  +  trbPerGame  + 
+ astPerGame  +  stlPerGame  +  blkPerGame  +  tovPerGame  +  pfPerGame  + 
+ ptsPerGame + pctWins + ptsPerGameTeam + astPerGameTeam + ptsPerGameTeam + drbPerGameTeam + tovPerGameTeam + pctFGPerGameTeam +  pctFTPerGameTeam + award_share_lagged + isMVP + totalMVP))
+
+forward_select <- lm(formula = award_share ~ award_share_lagged + ratioVORP + fg3mPerGame + 
+    ratioWS + ftaPerGame + stlPerGame + drbPerGame + minutesPerGame + 
+    pctFTRate + factor(groupPosition) + fg2aPerGame + pctUSG + 
+    ratioBPM + ptsPerGameTeam + astPerGame + pctDRB + pctAST + 
+    agePlayer + pctFGPerGameTeam + tovPerGameTeam + ftmPerGame + 
+    pctFT + ratioOWS, data = na.omit(train))
+vif(forward_select)
+
+backward_select <- lm(formula = award_share ~ factor(groupPosition) + ratioPER + pctTrueShooting+ pctFTRate + pctDRB + pctAST + pctSTL + pctBLK + pctTOV + pctUSG + ratioOWS + ratioOBPM + ratioDBPM + ratioVORP + countGamesStarted + pctFG + pctEFG + pctFT + minutesPerGame + fgmPerGame + ftmPerGame + drbPerGame + stlPerGame + trbPerGame + pfPerGame + ptsPerGame + pctFGPerGameTeam + pctFTPerGameTeam + ptsPerGameTeam, data = train)
+
+#choosing this one for now
+backward_select <- lm(formula = award_share ~ agePlayer + pct3PRate + pctFTRate + 
+    pctDRB + pctAST + pctUSG + ratioOWS + ratioWS + ratioDBPM + 
+    ratioBPM + ratioVORP + pctFT + minutesPerGame + fgmPerGame + 
+    fg3mPerGame + fg2aPerGame + ftaPerGame + drbPerGame + astPerGame + 
+    ptsPerGame + ptsPerGameTeam + tovPerGameTeam + pctFGPerGameTeam, data = train)
+
+#reducing multicolinearity
+backward_select <- lm(formula = award_share ~ factor(groupPosition) + pctTrueShooting + pctFTRate + pctDRB + pctAST + pctSTL + pctBLK + pctTOV + pctUSG + ratioVORP + countGamesStarted + ftmPerGame + pfPerGame + pctFGPerGameTeam + ptsPerGameTeam, data = train)
+
+backward_select <- lm(formula = award_share ~ agePlayer + pct3PRate + pctFTRate + 
+    pctDRB + pctAST + pctUSG + 
+    ratioBPM + ratioVORP + pctFT + ftaPerGame + drbPerGame + 
+    ptsPerGameTeam + tovPerGameTeam + pctFGPerGameTeam + 
+    award_share_lagged, data = train)
+
+train_numeric <- numeric <- dplyr::select(train, where(is.numeric))
+train_numeric <- train_numeric[,-1]
+cor <- cor(train_numeric, use = "complete.obs")
+cor <- as.data.frame(cor)
+cor <- cor %>% select(c("ratioPER", "pctTrueShooting", "pctFTRate", "pctDRB", "pctAST", "pctSTL", "pctBLK", "pctTOV", "pctUSG", "ratioOWS", "ratioOBPM", "ratioDBPM", "ratioVORP", "countGamesStarted", "pctFG", "pctEFG", "pctFT", "minutesPerGame", "fgmPerGame", "ftmPerGame", "drbPerGame", "stlPerGame", "trbPerGame", "pfPerGame", "ptsPerGame", "pctFGPerGameTeam", "pctFTPerGameTeam", "ptsPerGameTeam"))
+cor <- cor[rownames(cor) %in% c("ratioPER", "pctTrueShooting", "pctFTRate", "pctDRB", "pctAST", "pctSTL", "pctBLK", "pctTOV", "pctUSG", "ratioOWS", "ratioOBPM", "ratioDBPM", "ratioVORP", "countGamesStarted", "pctFG", "pctEFG", "pctFT", "minutesPerGame", "fgmPerGame", "ftmPerGame", "drbPerGame", "stlPerGame", "trbPerGame", "pfPerGame", "ptsPerGame", "pctFGPerGameTeam", "pctFTPerGameTeam", "ptsPerGameTeam"),]
+
+summary(backward_select)
+
+#sqrt transformation
+sqrt_lagged_model_likely <- train %>% mutate(sqrt_award_share = sqrt(award_share))
+
+sqrt_lm <- lm(sqrt_award_share ~  factor(groupPosition) + 
+ factor(slugPosition) +  agePlayer +  countGames + 
+ ratioPER  +  pctTrueShooting  +  pct3PRate  +  pctFTRate  +  pctORB  + 
+ pctDRB  +  pctTRB  +  pctAST  +  pctSTL  +  pctBLK  +  pctTOV  +  pctUSG  + 
+ ratioOWS  +  ratioDWS  +  ratioWS  +  ratioWSPer48  +  ratioOBPM  + 
+ ratioDBPM  +  ratioBPM  +  ratioVORP  +  countGamesStarted +  pctFG  + 
+ pctFG3  +  pctFG2  +  pctEFG  +  pctFT  +  minutesPerGame +  fgmPerGame  + 
+ fgaPerGame  +  fg3mPerGame  +  fg3aPerGame  +  fg2mPerGame  +  fg2aPerGame  + 
+ ftmPerGame  +  ftaPerGame  +  orbPerGame  +  drbPerGame  +  trbPerGame  + 
+ astPerGame  +  stlPerGame  +  blkPerGame  +  tovPerGame  +  pfPerGame  + 
+ ptsPerGame + pctWins + ptsPerGameTeam + astPerGameTeam + ptsPerGameTeam + drbPerGameTeam + tovPerGameTeam + pctFGPerGameTeam +  pctFTPerGameTeam + award_share_lagged + isMVP + totalMVP, data = sqrt_lagged_model_likely)
+
+summary(sqrt_lm)
+
+stepAIC(sqrt_lm, direction = "backward")
+sqrt_backward_select <- lm(formula = sqrt_award_share ~ agePlayer + ratioPER + pctTrueShooting + 
+    pctFTRate + pctDRB + pctTRB + pctAST + pctUSG + ratioWSPer48 + 
+    ratioOBPM + ratioVORP + countGamesStarted + pctFG + pctEFG + 
+    pctFT + minutesPerGame + fg3mPerGame + fg2mPerGame + ftaPerGame + 
+    drbPerGame + astPerGame + stlPerGame + blkPerGame + pfPerGame + 
+    ptsPerGame + ptsPerGameTeam + tovPerGameTeam + pctFGPerGameTeam + 
+    award_share_lagged + isMVP + totalMVP, data = sqrt_lagged_model_likely)
+
+
+lagged_stats_pred <- add_predictions(test, backward_select, var="pred")
+lagged_stats_pred %>% filter(is.na(pred)) %>% group_by(pred) %>% summarise(n())
+
+#checking if model would have gotten it right in each year
+lagged_stats_pred %>% filter(namePlayer == "Karl Malone")
+lagged_stats_model_likely %>% filter(namePlayer == "Karl Malone")
+lagged_stats_pred %>% filter(namePlayer == "Karl Malone") %>% summarise(yearSeason, slugSeason.x, minutesPerGame, countGames, countGamesStarted)
+mean(mvps_1981$minutesPerGame) - 3*sd(mvps_1981$minutesPerGame)
+mean(mvps_1981$countGamesStarted) - 3*sd(mvps_1981$countGamesStarted)
+mean(mvps_1981$countGames) - 3*sd(mvps_1981$countGames)
+
+#identifying duplicates
+nrow(lagged_stats_model_likely %>% group_by(namePlayer, yearSeason) %>% filter(n()>1))
+
+
+top_actual <- lagged_stats_model %>% 
+  group_by(yearSeason) %>%
+  top_n(1, award_share) %>% 
+  summarise(namePlayer, slugSeason.x, award_share) %>%
+  filter(yearSeason <= 2018)
+
+top_predicted <- lagged_stats_pred %>% 
+  group_by(yearSeason) %>%
+  top_n(1, pred) %>% 
+  summarise(namePlayer, slugSeason.x, pred, pred_squared = pred^2) %>% 
+  filter(yearSeason <= 2018)
+
+evaluation <- inner_join(top_actual, top_predicted, by=c("yearSeason", "namePlayer", "slugSeason.x"))
+nrow(evaluation)/nrow(top_predicted)
+
+```
+
+# Checking Assumptions for Initial Model(s)
+```{r}
+#sqrt model
+
+#no autocollinearity
+library(car)
+durbinWatsonTest(sqrt_lm)
+
+#serious fanning - no constant variance
+plot(sqrt_lm$fitted.values, sqrt_lm$residuals)
+abline(h=0)
+
+#residuals definitely not normal
+qqnorm(sqrt_lm$residuals)
+qqline(sqrt_lm$residuals)
+
+#sqrt model (backward selection)
+
+#no autocollinearity
+durbinWatsonTest(sqrt_backward_select)
+
+#serious fanning - no constant variance
+plot(sqrt_backward_select$fitted.values, sqrt_backward_select$residuals)
+abline(h=0)
+
+#residuals definitely not normal
+qqnorm(sqrt_backward_select$residuals)
+qqline(sqrt_backward_select$residuals)
+
+
+#normal linear model (backward selection)
+
+#no autocollinearity
+durbinWatsonTest(backward_select)
+
+#serious fanning - no constant variance
+plot(backward_select$fitted.values, backward_select$residuals)
+abline(h=0)
+
+#residuals definitely not normal
+qqnorm(backward_select$residuals)
+qqline(backward_select$residuals)
+
+
+#normal linear model (full)
+
+#no autocollinearity
+durbinWatsonTest(full_lm)
+
+#serious fanning - no constant variance
+plot(full_lm$fitted.values, full_lm$residuals)
+abline(h=0)
+
+#residuals definitely not normal
+qqnorm(full_lm$residuals)
+qqline(full_lm$residuals)
+
+
+#summarize all
+plot(sqrt_lm)
+plot(sqrt_backward_select)
+plot(full_lm)
+plot(backward_select)
+
+vif(sqrt_lm)
+vif(sqrt_backward_select)
+vif(full_lm)
+vif(backward_select)
+```
+
+# Basic vs Advanced Linear Models
+```{r}
+#just basic stats
+basic_lm <- lm(award_share ~ 
+ pctTrueShooting +  pctFG  + 
+ pctFG3  +  pctFG2  +  pctEFG  +  pctFT  + fgmPerGame  + 
+ fgaPerGame  +  fg3mPerGame  +  fg3aPerGame  +  fg2mPerGame  +  fg2aPerGame  + 
+ ftmPerGame  +  ftaPerGame  +  orbPerGame  +  drbPerGame  +  trbPerGame  + 
+ astPerGame  +  stlPerGame  +  blkPerGame  +  tovPerGame  +  pfPerGame  + 
+ ptsPerGame, data = lagged_stats_model_likely)
+
+#just advanced stats 
+adv_lm <- lm(award_share ~
+ ratioPER   +  pct3PRate  +  pctFTRate  +  pctORB  + 
+ pctDRB  +  pctTRB  +  pctAST  +  pctSTL  +  pctBLK  +  pctTOV  +  pctUSG  + 
+ ratioOWS  +  ratioDWS  +  ratioWS  +  ratioWSPer48  +  ratioOBPM  + 
+ ratioDBPM  +  ratioBPM  +  ratioVORP, data = lagged_stats_model_likely)
+
+summary(basic_lm)
+summary(adv_lm)
+```
+
+# Models for Award Share - Only MVPs
+```{r}
+full_lm_mvps_only <- lm(award_share ~  factor(groupPosition) + 
+ factor(slugPosition) +  agePlayer +  countGames + 
+ ratioPER  +  pctTrueShooting  +  pct3PRate  +  pctFTRate  +  pctORB  + 
+ pctDRB  +  pctTRB  +  pctAST  +  pctSTL  +  pctBLK  +  pctTOV  +  pctUSG  + 
+ ratioOWS  +  ratioDWS  +  ratioWS  +  ratioWSPer48  +  ratioOBPM  + 
+ ratioDBPM  +  ratioBPM  +  ratioVORP  +  countGamesStarted +  pctFG  + 
+ pctFG3  +  pctFG2  +  pctEFG  +  pctFT  +  minutesPerGame +  fgmPerGame  + 
+ fgaPerGame  +  fg3mPerGame  +  fg3aPerGame  +  fg2mPerGame  +  fg2aPerGame  + 
+ ftmPerGame  +  ftaPerGame  +  orbPerGame  +  drbPerGame  +  trbPerGame  + 
+ astPerGame  +  stlPerGame  +  blkPerGame  +  tovPerGame  +  pfPerGame  + 
+ ptsPerGame + pctWins + ptsPerGameTeam + astPerGameTeam + ptsPerGameTeam + drbPerGameTeam + tovPerGameTeam + pctFGPerGameTeam +  pctFTPerGameTeam + award_share_lagged + isMVP + totalMVP, data = filter(lagged_stats_model_likely, award_share>0))
+
+summary(full_lm_mvps_only)
+
+stepAIC(full_lm_mvps_only, direction = "backward")
+backward_select_mvps_only <- lm(formula = award_share ~ agePlayer + countGames + pctTrueShooting + 
+    pctFTRate + pctTOV + pctUSG + ratioWS + pctFG2 + pctFT + 
+    fg3aPerGame + fg2mPerGame + drbPerGame + pfPerGame + 
+    drbPerGameTeam + pctFGPerGameTeam + award_share_lagged, data = filter(lagged_stats_model_likely, 
+    award_share > 0))
+
+plot(backward_select_mvps_only)
+plot(full_lm_mvps_only)
+```
+
+# Down/Up sampling 
+```{r}
+#percent of positive award share and 0 award share in the data (all from 1980 onward)
+lagged_stats_model %>% mutate(class1 = ifelse(award_share>0, 1, 0)) %>% group_by(class1) %>% summarise(n()/nrow(lagged_stats_model))
+
+#sample <- sample(c(TRUE, FALSE), nrow(lagged_stats_model), replace=TRUE, prob=c(0.7,0.3))
+#train  <- lagged_stats_model[sample, ]
+#test   <- lagged_stats_model[!sample, ] 
+
+lagged_stats_model_aws <- lagged_stats_model %>% filter(yearSeason<=2018)
+
+train <- lagged_stats_model_aws %>% filter(yearSeason<=2008)
+test <- lagged_stats_model_aws %>% filter(yearSeason>2008)
+
+predictors <- train %>% select(-award_share)
+award_share_df <- train %>% select(yearSeason, award_share)
+
+class_membership <- train %>% mutate(class1 = ifelse(award_share>0, 1, 0)) 
+class_membership <- class_membership[,71]
+class_membership$class1 <- as.factor(class_membership$class1)
+downSampled <- downSample(predictors, class_membership$class1, list = FALSE, yname = "Class")
+ 
+downSampled %>% group_by(Class) %>% summarise(n()/nrow(downSampled))
+downSampled <- left_join(downSampled, award_share_df, by=c("namePlayer", "yearSeason"))
+
+
+down_sampled_lm <- lm(award_share ~  factor(groupPosition) + 
+ agePlayer +  countGames + 
+ ratioPER  +  pctTrueShooting  +  pct3PRate  +  pctFTRate  +  pctORB  + 
+ pctDRB  +  pctTRB  +  pctAST  +  pctSTL  +  pctBLK  +  pctTOV  +  pctUSG  + 
+ ratioOWS  +  ratioDWS  +  ratioWS  +  ratioWSPer48  +  ratioOBPM  + 
+ ratioDBPM  +  ratioBPM  +  ratioVORP  +  countGamesStarted +  pctFG  + 
+ pctFG3  +  pctFG2  +  pctEFG  +  pctFT  +  minutesPerGame +  fgmPerGame  + 
+ fgaPerGame  +  fg3mPerGame  +  fg3aPerGame  +  fg2mPerGame  +  fg2aPerGame  + 
+ ftmPerGame  +  ftaPerGame  +  orbPerGame  +  drbPerGame  +  trbPerGame  + 
+ astPerGame  +  stlPerGame  +  blkPerGame  +  tovPerGame  +  pfPerGame  + 
+ ptsPerGame + pctWins + ptsPerGameTeam + astPerGameTeam + ptsPerGameTeam + drbPerGameTeam + tovPerGameTeam + pctFGPerGameTeam +  pctFTPerGameTeam + totalMVP, data = downSampled)
+
+stepAIC(down_sampled_lm, direction = "backward")
+
+down_sampled_lm <- lm(formula = award_share ~ agePlayer + 
+    ratioPER + pctTrueShooting + ratioOWS + ratioWS + ratioWSPer48 + 
+    ratioVORP + pctEFG + pctFT + minutesPerGame + fgaPerGame + 
+    fg3mPerGame + fg3aPerGame + ftaPerGame + drbPerGame + astPerGame + 
+    blkPerGame + pfPerGame + pctWins + ptsPerGameTeam + drbPerGameTeam + 
+    totalMVP, data = downSampled)
+summary(down_sampled_lm)
+
+down_sampled_pred <- add_predictions(test, down_sampled_lm, var="pred")
+
+#find different way to evaluate accuracy - find top actual award share within test data (not going to be actual MVP but it makes more sense I think)
+#also go back and split test and train by year instead of randomly - can actually evaluate true MVP winners instead
+top_actual <- lagged_stats_model %>% 
+  group_by(yearSeason) %>%
+  top_n(1, award_share) %>% 
+  summarise(namePlayer, slugSeason.x, award_share) %>%
+  filter(yearSeason <= 2018)
+
+top_predicted <- down_sampled_pred %>% 
+  group_by(yearSeason) %>%
+  top_n(1, pred) %>% 
+  summarise(namePlayer, slugSeason.x, pred) %>% 
+  filter(yearSeason <= 2018)
+
+evaluation <- inner_join(top_actual, top_predicted, by=c("yearSeason", "namePlayer", "slugSeason.x"))
+nrow(evaluation)/nrow(top_predicted)
+
+```
+
+# Lagged GLMs (full, backward selection, basic, advanced)
+```{r}
+glm_train <- train %>%  
+  group_by(namePlayer) %>%
+  arrange(yearSeason) %>%
+  mutate(isMVP = lead(isMVP, 1)) %>%
+  mutate(isMVP = ifelse(is.na(isMVP), 0, isMVP))
+
+glm_test <- test %>% 
+  group_by(namePlayer) %>%
+  arrange(yearSeason) %>%
+  mutate(isMVP = lead(isMVP, 1)) %>%
+  mutate(isMVP = ifelse(is.na(isMVP), 0, isMVP)) %>%
+  mutate(isMVP = ifelse(namePlayer=="James Harden" & yearSeason==2018, 1, isMVP))
+
+glm_test %>% filter(is.na(isMVP))
+
+full_glm <- glm(isMVP ~  factor(groupPosition) + 
+ factor(slugPosition) +  agePlayer +  countGames + 
+ ratioPER  +  pctTrueShooting  +  pct3PRate  +  pctFTRate  +  pctORB  + 
+ pctDRB  +  pctTRB  +  pctAST  +  pctSTL  +  pctBLK  +  pctTOV  +  pctUSG  + 
+ ratioOWS  +  ratioDWS  +  ratioWS  +  ratioWSPer48  +  ratioOBPM  + 
+ ratioDBPM  +  ratioBPM  +  ratioVORP  +  countGamesStarted +  pctFG  + 
+ pctFG3  +  pctFG2  +  pctEFG  +  pctFT  +  minutesPerGame +  fgmPerGame  + 
+ fgaPerGame  +  fg3mPerGame  +  fg3aPerGame  +  fg2mPerGame  +  fg2aPerGame  + 
+ ftmPerGame  +  ftaPerGame  +  orbPerGame  +  drbPerGame  +  trbPerGame  + 
+ astPerGame  +  stlPerGame  +  blkPerGame  +  tovPerGame  +  pfPerGame  + 
+ ptsPerGame + pctWins + ptsPerGameTeam + astPerGameTeam + ptsPerGameTeam + drbPerGameTeam + tovPerGameTeam + pctFGPerGameTeam +  pctFTPerGameTeam, data = glm_train, family = binomial)
+
+summary(full_glm)
+
+empty_glm <- glm(isMVP ~ 1, data = glm_train, family=binomial)
+
+stepAIC(full_glm, direction = "backward")
+
+backward_select_glm <- glm(formula = isMVP ~ agePlayer + pct3PRate + pctFTRate + 
+    pctDRB + pctAST + pctUSG + ratioOWS + ratioWS + ratioDBPM + 
+    ratioBPM + ratioVORP + pctFT + minutesPerGame + fgmPerGame + 
+    fg3mPerGame + fg2aPerGame + ftaPerGame + drbPerGame + astPerGame + 
+    ptsPerGame + ptsPerGameTeam + tovPerGameTeam + pctFGPerGameTeam, 
+    family = binomial, data = glm_train)
+
+summary(backward_select_glm)
+
+basic_glm <- glm(isMVP ~ 
+ pctTrueShooting +  pctFG  + 
+ pctFG3  +  pctFG2  +  pctEFG  +  pctFT  + fgmPerGame  + 
+ fgaPerGame  +  fg3mPerGame  +  fg3aPerGame  +  fg2mPerGame  +  fg2aPerGame  + 
+ ftmPerGame  +  ftaPerGame  +  orbPerGame  +  drbPerGame  +  trbPerGame  + 
+ astPerGame  +  stlPerGame  +  blkPerGame  +  tovPerGame  +  pfPerGame  + 
+ ptsPerGame, data = glm_train, family = binomial)
+
+#just advanced stats 
+adv_glm <- glm(isMVP ~
+ ratioPER   +  pct3PRate  +  pctFTRate  +  pctORB  + 
+ pctDRB  +  pctTRB  +  pctAST  +  pctSTL  +  pctBLK  +  pctTOV  +  pctUSG  + 
+ ratioOWS  +  ratioDWS  +  ratioWS  +  ratioWSPer48  +  ratioOBPM  + 
+ ratioDBPM  +  ratioBPM  +  ratioVORP, data = lagged_stats_model_likely, family = binomial)
+
+summary(basic_glm)
+summary(adv_glm)
+
+#confusion matrix and AIC
+basic_glm$aic
+adv_glm$aic
+
+pred = predict(adv_glm, newdata=glm_test)
+pred = ifelse(pred > 0.5, 1, 0)
+
+confusionMatrix(data=as.factor(pred), as.factor(glm_test$isMVP), positive = "1")
+
+#checking accuracy
+lagged_stats_pred <- add_predictions(glm_test, adv_glm, var="pred", type = "response")
+lagged_stats_pred %>% filter(is.na(pred)) %>% group_by(pred) %>% summarise(n())
+
+top_predicted <- lagged_stats_pred %>% 
+  group_by(yearSeason) %>%
+  top_n(1, pred) %>% 
+  summarise(namePlayer, slugSeason.x, pred, pred_squared = pred^2) %>% 
+  filter(yearSeason <= 2018)
+
+evaluation <- inner_join(top_actual, top_predicted, by=c("yearSeason", "namePlayer", "slugSeason.x"))
+nrow(evaluation)/nrow(top_predicted)
+
+```
+
+
+
+# Trying current year model (not using prior year's stats)
+redo without filtering because filtering excludes some MVPs
+```{r}
+current_stats <- team_player_stats %>% mutate(totalMVP = lag(totalMVP, n=1)) %>% filter(yearSeason <= 2018)
+current_stats <- current_stats %>% 
+  mutate_at(vars(pctWins:pctFTPerGameTeam),~ifelse(is.na(.x), mean(.x, na.rm = TRUE), .x)) %>%
+  mutate(totalMVP = ifelse(is.na(totalMVP), 0, totalMVP))
+
+current_stats_likely <- current_stats %>% 
+  filter(minutesPerGame > (mean(mvps_1981$minutesPerGame) - 3*sd(mvps_1981$minutesPerGame))) %>%
+  filter(countGamesStarted > (mean(mvps_1981$countGamesStarted) - 3*sd(mvps_1981$countGamesStarted)))%>%
+  filter(countGames > (mean(mvps_1981$countGames) - 3*sd(mvps_1981$countGames)))
+
+na_count <-sapply(current_stats_likely, function(y) sum(length(which(is.na(y)))))
+na_count <- data.frame(na_count)
+
+#note: split is 2008 for unfiltered data
+current_train <- current_stats_likely %>% filter(yearSeason<=2007)
+current_test <- current_stats_likely %>% filter(yearSeason>2007)
+
+current_train <- current_stats %>% filter(yearSeason<=2008)
+current_test <- current_stats %>% filter(yearSeason>2008)
+
+# checking initial class split
+current_train %>% mutate(class1 = ifelse(award_share>0, 1, 0)) %>% group_by(class1) %>% summarise(n()/nrow(current_train))
+
+# LM (no downsampling)
+current_lm <- lm(award_share ~  factor(groupPosition) + 
+ agePlayer +  countGames + 
+ ratioPER  +  pctTrueShooting  +  pct3PRate  +  pctFTRate  +  pctORB  + 
+ pctDRB  +  pctTRB  +  pctAST  +  pctSTL  +  pctBLK  +  pctTOV  +  pctUSG  + 
+ ratioOWS  +  ratioDWS  +  ratioWS  +  ratioWSPer48  +  ratioOBPM  + 
+ ratioDBPM  +  ratioBPM  +  ratioVORP  +  countGamesStarted +  pctFG  + 
+ pctFG3  +  pctFG2  +  pctEFG  +  pctFT  +  minutesPerGame +  fgmPerGame  + 
+ fgaPerGame  +  fg3mPerGame  +  fg3aPerGame  +  fg2mPerGame  +  fg2aPerGame  + 
+ ftmPerGame  +  ftaPerGame  +  orbPerGame  +  drbPerGame  +  trbPerGame  + 
+ astPerGame  +  stlPerGame  +  blkPerGame  +  tovPerGame  +  pfPerGame  + 
+ ptsPerGame + pctWins + ptsPerGameTeam + astPerGameTeam + ptsPerGameTeam + drbPerGameTeam + tovPerGameTeam + pctFGPerGameTeam +  pctFTPerGameTeam + totalMVP, data = current_train)
+
+stepAIC(current_lm, direction = "backward")
+
+#totalMVP was taking over - removed it 
+current_lm <- lm(formula = award_share ~ factor(groupPosition) + ratioPER + 
+    pctTrueShooting + pctFTRate + pctDRB + pctAST + pctSTL + 
+    pctBLK + pctTOV + pctUSG + ratioOWS + ratioOBPM + ratioDBPM + 
+    ratioVORP + countGamesStarted + pctFG + pctEFG + pctFT + 
+    minutesPerGame + fgmPerGame + fgaPerGame + fg3aPerGame + 
+    fg2mPerGame + fg2aPerGame + ftmPerGame + ftaPerGame + drbPerGame + 
+    trbPerGame + stlPerGame + blkPerGame + tovPerGame + pfPerGame + 
+    ptsPerGameTeam + pctFGPerGameTeam + pctFTPerGameTeam, 
+    data = current_train)
+summary(current_lm)
+
+#this is the one for now
+current_lm <- lm(formula = award_share ~ agePlayer + pct3PRate + pctFTRate + 
+    pctDRB + pctAST + pctUSG + ratioOWS + ratioWS + ratioDBPM + 
+    ratioBPM + ratioVORP + pctFT + minutesPerGame + fgmPerGame + 
+    fg3mPerGame + fg2aPerGame + ftaPerGame + drbPerGame + astPerGame + 
+    ptsPerGame + ptsPerGameTeam + tovPerGameTeam + pctFGPerGameTeam, data = current_train)
+summary(current_lm)
+plot(current_lm)
+
+current_pred <- add_predictions(current_test, current_lm, var="pred")
+
+top_predicted <- current_pred %>% 
+  group_by(yearSeason) %>%
+  top_n(1, pred) %>% 
+  summarise(namePlayer, slugSeason.x, pred) %>% 
+  filter(yearSeason <= 2018)
+
+evaluation <- inner_join(top_actual, top_predicted, by=c("yearSeason", "namePlayer", "slugSeason.x"))
+nrow(evaluation)/nrow(top_predicted)
+
+sqrt(mean(current_lm$residuals^2))
+sqrt(mean(full_lm$residuals^2))
+
+# GLM (no downsampling)
+
+current_glm <- glm(formula = isMVP ~ factor(groupPosition) + ratioPER + 
+    pctTrueShooting + pctFTRate + pctDRB + pctAST + pctSTL + 
+    pctBLK + pctTOV + pctUSG + ratioOWS + ratioOBPM + ratioDBPM + 
+    ratioVORP + countGamesStarted + pctFG + pctEFG + pctFT + 
+    minutesPerGame + fgmPerGame + fgaPerGame + fg3aPerGame + 
+    fg2mPerGame + fg2aPerGame + ftmPerGame + ftaPerGame + drbPerGame + 
+    trbPerGame + stlPerGame + blkPerGame + tovPerGame + pfPerGame + 
+    ptsPerGameTeam + pctFGPerGameTeam + pctFTPerGameTeam, 
+    data = current_train, family = binomial)
+
+current_glm <- glm(formula = isMVP ~ pctTrueShooting + pctFTRate + pctBLK + 
+    ratioOWS + ratioOBPM + ratioDBPM + ratioVORP + countGamesStarted + 
+    pctEFG + fgmPerGame + fgaPerGame + fg3aPerGame + fg2mPerGame + 
+    fg2aPerGame + ftmPerGame + ftaPerGame + trbPerGame + stlPerGame + 
+    tovPerGame + pfPerGame + pctFGPerGameTeam, family = binomial, 
+    data = current_train)
+summary(current_glm)
+
+#this is the one for now
+current_glm <- glm(formula = isMVP ~ agePlayer + pct3PRate + pctFTRate + 
+    pctDRB + pctAST + pctUSG + ratioOWS + ratioWS + ratioDBPM + 
+    ratioBPM + ratioVORP + pctFT + minutesPerGame + fgmPerGame + 
+    fg3mPerGame + fg2aPerGame + ftaPerGame + drbPerGame + astPerGame + 
+    ptsPerGame + ptsPerGameTeam + tovPerGameTeam + pctFGPerGameTeam, family = binomial, 
+    data = current_train)
+summary(current_glm)
+
+pred = predict(current_glm, newdata=current_test)
+pred = ifelse(pred > 0.5, 1, 0)
+
+confusionMatrix(data=as.factor(pred), as.factor(current_test$isMVP), positive = "1")
+
+current_pred <- add_predictions(current_test, current_glm, var="pred", type = "response")
+
+top_predicted <- current_pred %>% 
+  group_by(yearSeason) %>%
+  top_n(1, pred) %>% 
+  summarise(namePlayer, slugSeason.x, pred) %>% 
+  filter(yearSeason <= 2018)
+
+evaluation <- inner_join(top_actual, top_predicted, by=c("yearSeason", "namePlayer", "slugSeason.x"))
+nrow(evaluation)/nrow(top_predicted)
+
+# LM (with down-sampling/up-sampling)
+predictors <- current_train %>% select(-award_share)
+award_share_df <- current_train %>% select(yearSeason, award_share)
+
+class_membership <- current_train %>% mutate(class1 = ifelse(award_share>0, 1, 0)) 
+class_membership <- class_membership[,70]
+class_membership$class1 <- as.factor(class_membership$class1)
+upSampled <- upSample(predictors, class_membership$class1, list = FALSE, yname = "Class")
+
+upSampled %>% group_by(Class) %>% summarise(n()/nrow(upSampled))
+upSampled <- left_join(upSampled, award_share_df, by=c("namePlayer", "yearSeason"))
+
+current_lm_ds <- lm(formula = award_share ~ factor(groupPosition) + ratioPER + 
+    pctTrueShooting + pctFTRate + pctDRB + pctAST + pctSTL + 
+    pctBLK + pctTOV + pctUSG + ratioOWS + ratioOBPM + ratioDBPM + 
+    ratioVORP + countGamesStarted + pctFG + pctEFG + pctFT + 
+    minutesPerGame + fgmPerGame + fgaPerGame + fg3aPerGame + 
+    fg2mPerGame + fg2aPerGame + ftmPerGame + ftaPerGame + drbPerGame + 
+    trbPerGame + stlPerGame + blkPerGame + tovPerGame + pfPerGame + 
+    ptsPerGameTeam + pctFGPerGameTeam + pctFTPerGameTeam, 
+    data = upSampled)
+summary(current_lm_ds)
+plot(current_lm_ds)
+
+current_pred_ds <- add_predictions(current_test, current_lm_ds, var="pred")
+
+top_predicted <- current_pred_ds %>% 
+  group_by(yearSeason) %>%
+  top_n(1, pred) %>% 
+  summarise(namePlayer, slugSeason.x, pred) %>% 
+  filter(yearSeason <= 2018)
+
+evaluation <- inner_join(top_actual, top_predicted, by=c("yearSeason", "namePlayer", "slugSeason.x"))
+nrow(evaluation)/nrow(top_predicted)
+
+
+# GLM (will have to upsample for this because there are too few observations
+predictors <- current_train %>% select(-isMVP)
+award_share_df <- current_train %>% select(yearSeason, isMVP)
+
+class_membership <- current_train %>% mutate(class1 = ifelse(isMVP==1, 1, 0)) 
+class_membership <- class_membership[,70]
+class_membership$class1 <- as.factor(class_membership$class1)
+upSampled <- upSample(predictors, class_membership$class1, list = FALSE, yname = "Class")
+ 
+upSampled %>% group_by(Class) %>% summarise(n()/nrow(upSampled))
+upSampled <- left_join(upSampled, award_share_df, by=c("namePlayer", "yearSeason"))
+
+current_glm <-  glm(formula = isMVP ~ pctTrueShooting + pctFTRate + pctBLK + 
+    ratioOWS + ratioOBPM + ratioDBPM + ratioVORP + countGamesStarted + 
+    pctEFG + fgmPerGame + fgaPerGame + fg3aPerGame + fg2mPerGame + 
+    fg2aPerGame + ftmPerGame + ftaPerGame + trbPerGame + stlPerGame + 
+    tovPerGame + pfPerGame + pctFGPerGameTeam, family = binomial, 
+    data = upSampled)
+summary(current_glm)
+
+current_pred <- add_predictions(current_test, current_glm, var="pred", type = "response")
+current_pred %>% summarise(namePlayer, yearSeason, pred, award_share, isMVP)
+
+top_predicted <- current_pred %>% 
+  group_by(yearSeason) %>%
+  top_n(1, pred) %>% 
+  summarise(namePlayer, slugSeason.x, pred) %>% 
+  filter(yearSeason <= 2018)
+
+evaluation <- inner_join(top_actual, top_predicted, by=c("yearSeason", "namePlayer", "slugSeason.x"))
+nrow(evaluation)/nrow(top_predicted)
+
+```
+
+# SMOTE with current data
+```{r}
+current_train_numeric <- current_train %>% select_if(is.numeric)
+current_train_numeric <- current_train_numeric[,-c(1,48)]
+na_count <-sapply(current_train_numeric, function(y) sum(length(which(is.na(y)))))
+current_train_numeric <- current_train_numeric %>% filter(complete.cases(current_train_numeric))
+
+smote <- SMOTE(award_share ~ ., current_train_numeric, K=5)
+
+smote <- SMOTE(X = current_train_numeric[,-53], target = current_train_numeric$award_share, K=5)
+```
+
+# Simulate resampling to see changes in the final model
+problem: too few observations to converge?
+```{r}
+# past glm
+sim_train1 <- glm_train %>% filter(isMVP==1)
+sim_train0 <- glm_train %>% filter(isMVP==0) 
+sim_train0 <- sim_train0[sample(1:nrow(sim_train0), 27, replace=F), ]
+sim_train <- rbind(sim_train0, sim_train1)
+
+simmed_glm <- glm(formula = isMVP ~ totalMVP + award_share_lagged + ratioDWS + ratioOWS + ratioVORP, 
+    family = binomial, data = sim_train)
+
+summary(simmed_glm)
+
+#current glm
+sim_train1 <- current_train %>% filter(isMVP==1)
+sim_train0 <- current_train %>% filter(isMVP==0) 
+sim_train0 <- sim_train0[sample(1:nrow(sim_train0), 26, replace=F), ]
+sim_train <- rbind(sim_train0, sim_train1)
+
+simmed_glm <- glm(formula = isMVP ~ pctTrueShooting + pctFTRate + pctBLK + 
+    ratioOWS + ratioOBPM + ratioDBPM + ratioVORP + countGamesStarted + 
+    pctEFG + fgmPerGame + fgaPerGame + fg3aPerGame + fg2mPerGame + 
+    fg2aPerGame + ftmPerGame + ftaPerGame + trbPerGame + stlPerGame + 
+    tovPerGame + pfPerGame + pctFGPerGameTeam, family = binomial, 
+    data = sim_train)
+
+summary(simmed_glm)
+
+#past glm upsampling manually 
+#gets similar predictions every time random sample is taken (good sign)
+sim_train1 <- glm_train %>% filter(isMVP==1)
+sim_train0 <- glm_train %>% filter(isMVP==0)
+sim_train1 <- sim_train1[sample(1:nrow(sim_train1), 11022, replace=T), ]
+sim_train1 %>% group_by(namePlayer) %>% summarise(n())
+sim_train <- rbind(sim_train0, sim_train1)
+sim_train <- sim_train %>% mutate(totalMVP = ifelse(is.na(totalMVP), 0, totalMVP))
+simmed_glm <- glm(formula = isMVP ~ totalMVP + award_share_lagged + ratioDWS + ratioOWS + ratioVORP, 
+    family = binomial, data = sim_train)
+
+summary(simmed_glm)
+
+lagged_stats_pred <- add_predictions(glm_test, simmed_glm, var="pred", type = "response")
+lagged_stats_pred %>% summarise(namePlayer, yearSeason, pred, award_share, isMVP)
+
+top_predicted <- lagged_stats_pred %>% 
+  group_by(yearSeason) %>%
+  top_n(1, pred) %>% 
+  summarise(namePlayer, slugSeason.x, pred) %>% 
+  filter(yearSeason <= 2018)
+
+evaluation <- inner_join(top_actual, top_predicted, by=c("yearSeason", "namePlayer", "slugSeason.x"))
+nrow(evaluation)/nrow(top_predicted)
+
+pred = predict(simmed_glm, newdata=glm_test, type = "response")
+pred = ifelse(pred > 0.5, 1, 0)
+
+confusionMatrix(data=as.factor(pred), as.factor(glm_test$isMVP), positive = "1")
+mean(pred == glm_test$isMVP, na.rm = T)
+```
+
+# XGBoost (classification)
+
+## Training, validation, and test set creation
+```{r}
+set.seed(1)
+xgboost_data <- current_stats
+label = xgboost_data$isMVP
+xgboost_data$isMVP = NULL
+n = nrow(xgboost_data)
+year = (xgboost_data %>% filter(yearSeason>2008))$yearSeason
+year2 = (xgboost_data %>% filter(yearSeason>2002 & yearSeason<=2008))$yearSeason
+
+names_backward_select <- c("agePlayer", "pct3PRate", "pctFTRate", "pctDRB", "pctAST", "pctUSG", 
+    "ratioOWS", "ratioWS", "ratioBPM", "ratioDBPM","ratioVORP", "pctFT", "minutesPerGame", 
+    "fgmPerGame", "fg3mPerGame", "fg2aPerGame", "ftaPerGame", "drbPerGame", "astPerGame", 
+    "ptsPerGame", "ptsPerGameTeam", "tovPerGameTeam", "pctFGPerGameTeam")
+
+
+train.data = data.matrix(xgboost_data %>% filter(yearSeason<=2002) %>% select(numeric_names) %>% select_if(is.numeric))
+train.data <- train.data[,-1]
+train.label = (current_train %>% filter(yearSeason<=2002))$isMVP
+
+#train_id <- sample(1:nrow(train.data), size = floor(0.8 * nrow(train.data)), replace=FALSE) 
+
+# Split in training and validation (80/20)
+validation.data <- data.matrix(xgboost_data %>% filter(yearSeason<=2008 & yearSeason >2002) %>% select(numeric_names))
+validation.data <- validation.data[,-1]
+validation.label = (current_train %>% filter(yearSeason<=2008 & yearSeason>2002))$isMVP
+
+#train.data <- train.data[train_id,]
+#train.label = current_train[train_id,]$isMVP
+
+
+test.data = data.matrix(xgboost_data %>% filter(yearSeason>2008) %>% select(numeric_names) %>% select_if(is.numeric))
+test.data <- test.data[, -1]
+test.label = current_test$isMVP
+```
+
+## Create xgb.Matrix objects
+```{r}
+# Transform the two data sets into xgb.Matrix
+xgb.train = xgb.DMatrix(data=train.data,label=train.label)
+xgb.validation = xgb.DMatrix(data=validation.data,label=validation.label)
+xgb.test = xgb.DMatrix(data=test.data,label=test.label)
+```
+
+## Define the main parameters
+```{r}
+# Define the parameters for regression
+#eta - 0.2 or 0.3
+#gamma ~ 3
+#max depth = 6
+params = list(
+  booster="gbtree",
+  eta=0.3,
+  objective="binary:logistic",
+  eval_metric="logloss",
+  eval_metric="error",
+  eval_metric="auc",
+  scale_pos_weight = 393.6071, 
+  gamma = 4,
+  max_depth = 6,
+  min_child_weight = 10
+)
+```
+
+
+## Train the model
+```{r}
+# Train the XGBoost model
+xgb.fit=xgb.train(
+  params=params,
+  data=xgb.train,
+  nrounds=100,
+  nthreads=1,
+  early_stopping_rounds=10,
+  watchlist=list(train=xgb.train,val=xgb.validation),
+  verbose=0
+)
+
+# Review the final model and results
+xgb.fit
+importance_matrix <- xgb.importance(colnames(train.data), model = xgb.fit)
+importance_matrix_top_features <- importance_matrix[1:20, 1]
+xgb.plot.importance(xgb.importance(colnames(train.data), model = xgb.fit))
+
+```
+
+```{r}
+# Predict outcomes with the validation data (to tune model)
+xgb.pred = predict(xgb.fit, validation.data ,reshape=T)
+pred.label = as.factor(round(xgb.pred))
+confusionMatrix(as.factor(validation.label), pred.label)
+
+xgb.pred = as.data.frame(xgb.pred)
+validation.data.df <- cbind(validation.data, validation.label)
+validation.data.df <- cbind(validation.data.df, xgb.pred)
+validation.data.df <- cbind(validation.data.df, year2)
+
+#evaluate "accuracy"
+validation.data.df <- as.data.frame(validation.data.df)
+validation.data.df %>% select(xgb.pred, validation.label, year2) %>% group_by(year2) %>% slice_max(order_by = xgb.pred, n = 1)
+
+
+# Predict outcomes with the test data (to evaluate results but this MUST BE INDEPENDENT so I can't use these results to tune model)
+xgb.pred = predict(xgb.fit,test.data,reshape=T)
+pred.label = as.factor(round(xgb.pred))
+confusionMatrix(as.factor(test.label), pred.label)
+
+xgb.pred = as.data.frame(xgb.pred)
+test.data.df <- cbind(test.data, test.label)
+test.data.df <- cbind(test.data.df, xgb.pred)
+test.data.df <- cbind(test.data.df, year)
+
+#evaluate "accuracy"
+test.data.df <- as.data.frame(test.data.df)
+test.data.df %>% select(xgb.pred, test.label, year) %>% group_by(year) %>% slice_max(order_by = xgb.pred, n = 1)
+```
+
+# XGBoost (regression)
+advanced stats (WS if in, VORP if WS is removed) take over and are the only variable included because of gain of 1
+
+## Training, validation, and test set creation
+```{r}
+set.seed(1)
+xgboost_data <- current_stats
+label = xgboost_data$award_share
+xgboost_data$award_share = NULL
+n = nrow(xgboost_data)
+year = (xgboost_data %>% filter(yearSeason>2008))$yearSeason
+year2 = (xgboost_data %>% filter(yearSeason>2002 & yearSeason<=2008))$yearSeason
+
+names_backward_select <- c("agePlayer", "pct3PRate", "pctFTRate", "pctDRB", "pctAST", "pctUSG", 
+    "ratioOWS", "ratioWS", "ratioBPM", "ratioDBPM","ratioVORP", "pctFT", "minutesPerGame", 
+    "fgmPerGame", "fg3mPerGame", "fg2aPerGame", "ftaPerGame", "drbPerGame", "astPerGame", 
+    "ptsPerGame", "ptsPerGameTeam", "tovPerGameTeam", "pctFGPerGameTeam")
+
+
+train.data = data.matrix(xgboost_data %>% filter(yearSeason<=2002) %>% select(names_backward_select) %>% select_if(is.numeric))
+train.data <- train.data[,-1]
+train.label = (current_train %>% filter(yearSeason<=2002))$award_share
+train.label2 = (current_train %>% filter(yearSeason<=2002))$isMVP
+
+#train_id <- sample(1:nrow(train.data), size = floor(0.8 * nrow(train.data)), replace=FALSE) 
+
+# Split in training and validation (80/20)
+validation.data <- data.matrix(xgboost_data %>% filter(yearSeason<=2008 & yearSeason >2002) %>% select(names_backward_select))
+validation.data <- validation.data[,-1]
+validation.label = (current_train %>% filter(yearSeason<=2008 & yearSeason>2002))$award_share
+validation.label2 = (current_train %>% filter(yearSeason<=2008 & yearSeason>2002))$isMVP
+
+#train.data <- train.data[train_id,]
+#train.label = current_train[train_id,]$isMVP
+
+
+test.data = data.matrix(xgboost_data %>% filter(yearSeason>2008) %>% select(names_backward_select) %>% select_if(is.numeric))
+test.data <- test.data[, -1]
+test.label = current_test$award_share
+test.label2 = current_test$isMVP
+```
+
+## Create xgb.Matrix objects
+```{r}
+# Transform the two data sets into xgb.Matrix
+xgb.train = xgb.DMatrix(data=train.data,label=train.label)
+xgb.validation = xgb.DMatrix(data=validation.data,label=validation.label)
+xgb.test = xgb.DMatrix(data=test.data,label=test.label)
+```
+
+## Define the main parameters
+```{r}
+# Define the parameters for regression
+#eta - 0.2 or 0.3
+#gamma ~ 3
+#max depth = 6
+params = list(
+  booster="gbtree",
+  eta=0.3,
+  objective="reg:squarederror",
+  eval_metric="rmse",
+  eval_metric="mae",
+  scale_pos_weight = 393.6071, 
+  gamma = 0,
+  max_depth = 6,
+  min_child_weight = 10
+)
+```
+
+
+## Train the model
+```{r}
+# Train the XGBoost model
+xgb.fit=xgb.train(
+  params=params,
+  data=xgb.train,
+  nrounds=100,
+  nthreads=1,
+  early_stopping_rounds=10,
+  watchlist=list(train=xgb.train,val=xgb.validation),
+  verbose=0
+)
+
+# Review the final model and results
+xgb.fit
+importance_matrix <- xgb.importance(colnames(train.data), model = xgb.fit)
+importance_matrix_top_features <- importance_matrix[1:20, 1]
+xgb.plot.importance(xgb.importance(colnames(train.data), model = xgb.fit))
+
+```
+
+```{r}
+# Predict outcomes with the validation data (to tune model)
+xgb.pred = predict(xgb.fit, validation.data ,reshape=T)
+xgb.pred = as.data.frame(xgb.pred)
+validation.data.df <- cbind(validation.data, validation.label)
+validation.data.df <- cbind(validation.data.df, xgb.pred)
+validation.data.df <- cbind(validation.data.df, year2)
+validation.data.df <- cbind(validation.data.df, validation.label2)
+
+#evaluate "accuracy"
+validation.data.df <- as.data.frame(validation.data.df)
+validation.data.df %>% select(year2, xgb.pred, validation.label, validation.label2) %>% group_by(year2) %>% slice_max(order_by = xgb.pred, n = 1)
+
+
+# Predict outcomes with the test data (to evaluate results but this MUST BE INDEPENDENT so I can't use these results to tune model)
+xgb.pred = predict(xgb.fit,test.data,reshape=T)
+xgb.pred = as.data.frame(xgb.pred)
+test.data.df <- cbind(test.data, test.label)
+test.data.df <- cbind(test.data.df, xgb.pred)
+test.data.df <- cbind(test.data.df, year)
+test.data.df <- cbind(test.data.df, test.label2)
+
+#evaluate "accuracy"
+test.data.df <- as.data.frame(test.data.df)
+test.data.df %>% select(xgb.pred, test.label, test.label2, year) %>% group_by(year) %>% slice_max(order_by = xgb.pred, n=1)
+```
+
+# XGboost (simpler, regression on award share)
+```{r}
+xgb_train_numeric <- current_train_numeric %>% select(-isMVP, -yearSeason, -year, -merge_year, -pctORB, -ratioDBPM, -pctFT, -pctFG, -fg3aPerGame, -fg3mPerGame, -orbPerGame, -ratioDWS)
+nrow(filter(xgb_train_numeric, award_share==0)) / nrow(filter(xgb_train_numeric, award_share != 0))
+
+tune_grid <- expand.grid(
+  nrounds = seq(from = 200, to = 500, by = 100),
+  eta = c(0.025, 0.05, 0.1, 0.3),
+  max_depth = 2:10,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+tune_control <- caret::trainControl(
+  method = "cv", # cross-validation
+  number = 10, # with n folds 
+  #index = createFolds(tr_treated$Id_clean), # fix the folds
+  verboseIter = TRUE, # no training log
+  allowParallel = FALSE # FALSE for reproducible results 
+)
+
+award_share_tuned_mod <- xgb_train_numeric %>%
+  caret::train(
+  award_share ~ .,
+  data = .,
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "xgbTree",
+  verbose = FALSE,
+  scale_pos_weight = 16.5497
+)
+
+#importance tables and graphs
+imp <- varImp(award_share_tuned_mod, scale = F)
+sum(imp$importance$Overall)
+#imp <- imp %>% mutate(Overall = format(round(Overall, 5), scientific = FALSE, big.mark = ","))
+
+ggplot(imp, mapping=NULL, top=10) +
+  labs(title = "XGBoost Feature Importance") +
+  theme(plot.title = element_text(hjust = 0.5, color = "Purple"), plot.subtitle = element_text(hjust = 0.5, color = "Salmon"))
+
+imp2 <- imp$importance %>% rownames_to_column()
+ggplot(imp2[1:10,], mapping=aes(x=Overall, y=reorder(rowname, Overall))) +
+  geom_col() +
+  labs(title = "XGBoost Feature Importance", x="Importance", y="Variable") +
+  theme(plot.title = element_text(hjust = 0.5, color = "Purple"), plot.subtitle = element_text(hjust = 0.5, color = "Salmon")) +
+  theme_clean() + 
+  scale_y_discrete(labels = c("AST%", "FG2A/G", "FG2M/G", "AST/G", "TOV/G", "FGA/G", "PER", "VORP", "Win%", "WS"))
+
+current_test_complete <- current_test %>% 
+  select(-isMVP, -yearSeason, -year, -merge_year) %>%
+  na.omit()
+award_share_preds <- predict(award_share_tuned_mod, newdata = current_test_complete, type = "raw")
+current_test_results <- cbind(current_test_complete, award_share_preds)
+current_test_results<- current_test_results %>% rename("pred" = "...66")
+
+current_test_results %>%
+  select(namePlayer, slugSeason.x, award_share, pred) %>%
+  arrange(slugSeason.x, -pred) %>%
+  group_by(slugSeason.x) %>%
+  filter(row_number() %in% c(1))
+
+current_test_results %>%
+  select(namePlayer, slugSeason.x, award_share, pred) %>%
+  arrange(slugSeason.x, -award_share) %>%
+  group_by(slugSeason.x) %>%
+  filter(row_number() %in% c(1))
+
+
+award_share_tuned_mod$results
+award_share_tuned_mod$bestTune
+
+sqrt(mean((current_test_results$award_share - current_test_results$pred)^2))
+sqrt(mean((current_pred$award_share - current_pred$pred)^2, na.rm = T))
+#saveRDS(xgb_attack_angle_tuned_mod, "attack_angle_mod.rds")
+
+#xgb_attack_angle_tuned_mod <- readRDS("attack_angle_mod.rds")
+
+```
+
+# XGBoost (simpler, classification)
+```{r}
+xgb_train_numeric <- current_train_numeric %>% select(-award_share, -yearSeason, -year, -merge_year)
+xgb_train_numeric$isMVP <- as.factor(xgb_train_numeric$isMVP)
+
+
+tune_grid <- expand.grid(
+  nrounds = seq(from = 200, to = 500, by = 100),
+  eta = c(0.025, 0.05, 0.1, 0.3),
+  max_depth = 2:10,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+tune_control <- caret::trainControl(
+  method = "cv", # cross-validation
+  number = 3, # with n folds 
+  #index = createFolds(tr_treated$Id_clean), # fix the folds
+  verboseIter = TRUE, # no training log
+  allowParallel = FALSE # FALSE for reproducible results 
+)
+
+isMVP_tuned_mod <- xgb_train_numeric %>%
+  caret::train(
+  isMVP ~ .,
+  data = .,
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "xgbTree",
+  verbose = FALSE
+)
+
+#importance tables and graphs
+imp <- varImp(award_share_tuned_mod, scale = F)
+sum(imp$importance$Overall)
+#imp <- imp %>% mutate(Overall = format(round(Overall, 5), scientific = FALSE, big.mark = ","))
+
+ggplot(imp, mapping=NULL, top=10) +
+  labs(title = "XGBoost Feature Importance") +
+  theme(plot.title = element_text(hjust = 0.5, color = "Purple"), plot.subtitle = element_text(hjust = 0.5, color = "Salmon")) 
+
+current_test_complete <- current_test %>% 
+  select(-award_share, -yearSeason, -year, -merge_year) %>%
+  na.omit()
+award_share_preds <- predict(isMVP_tuned_mod, newdata = current_test_complete, type = "prob")
+current_test_results <- cbind(current_test_complete, award_share_preds)
+
+current_test_results %>%
+  select(namePlayer, slugSeason.x, isMVP, `0`, `1`) %>%
+  arrange(slugSeason.x, -`1`) %>%
+  group_by(slugSeason.x) %>%
+  filter(row_number() %in% c(1))
+
+current_test_results %>%
+  select(namePlayer, slugSeason.x, isMVP, `0`, `1`) %>%
+  arrange(slugSeason.x, -isMVP) %>%
+  group_by(slugSeason.x) %>%
+  filter(row_number() %in% c(1))
+```
+
+
+# Exporting Model Data
+```{r}
+write_csv(lagged_stats_model_likely, "model_data.csv")
+write_csv(sim_train, "sim_train.csv")
+write_csv(current_train, "current_train2.csv")
+write_csv(current_test, "current_test2.csv")
+
+htmlTable(evaluation)
+
+```
+
+# New Season Data to Predict On
+```{r}
+#advanced and per game stats
+z_player_stats <- bref_players_stats(seasons = 2023, tables = c("advanced", "per_game"))
+z_player_stats <- z_player_stats %>% group_by(namePlayer, slugSeason) %>% dplyr::slice(1)
+
+#what draft pick they were
+#need more identifiers to prevent duplicates
+z_drafts <- drafts(draft_years = 2022, nest_data = FALSE, return_message = TRUE)
+z_drafts <- z_drafts %>% select(namePlayer, numberPickOverall, idPlayer)
+z_drafts <- rbind(drafts2, z_drafts)
+
+z_drafts %>% group_by(namePlayer) %>% summarise(n= n()) %>% filter(n>1)
+
+z_player_stats_draft_pick <- left_join(z_player_stats, z_drafts, by=c("idPlayerNBA"="idPlayer", "namePlayer"))
+
+
+#adding attributes to main data
+z_full_player_stats <- left_join(z_player_stats_draft_pick, attributes, by=c("namePlayer"="Player"))
+
+#prior MVPs variables
+total_mvps_2023 <- data.frame(namePlayer = c("LeBron James", "Giannis Antetokounmpo", "Nikola Jokic", "James Harden", "Russell Westbrook", "Stephen Curry", "Kevin Durant", "Derrick Rose"), totalMVP = c(4, 2, 2, 1, 1, 2, 1, 1))
+z_full_player_stats <- z_full_player_stats %>% left_join(total_mvps_2023)
+z_full_player_stats <- z_full_player_stats %>% 
+  mutate(totalMVP = ifelse(is.na(totalMVP), 0, totalMVP)) 
+  
+#removing unnecessary variables 
+z_full_player_stats_clean <- z_full_player_stats %>% select(c("slugSeason", "namePlayer", "groupPosition", "yearSeason", 
+"slugPosition", "agePlayer", "slugTeamBREF", "countGames", "slugTeamsBREF", "ratioPER", 
+"pctTrueShooting", "pct3PRate", "pctFTRate", "pctORB", "pctDRB", 
+"pctTRB", "pctAST", "pctSTL", "pctBLK", "pctTOV", "pctUSG", "ratioOWS", 
+"ratioDWS", "ratioWS", "ratioWSPer48", "ratioOBPM", "ratioDBPM", 
+"ratioBPM", "ratioVORP", "countGamesStarted", 
+"pctFG", "pctFG3", "pctFG2", "pctEFG", "pctFT", "minutesPerGame", 
+"fgmPerGame", "fgaPerGame", "fg3mPerGame", "fg3aPerGame", "fg2mPerGame", 
+"fg2aPerGame", "ftmPerGame", "ftaPerGame", "orbPerGame", "drbPerGame", 
+"trbPerGame", "astPerGame", "stlPerGame", "blkPerGame", "tovPerGame", 
+"pfPerGame", "ptsPerGame", "numberPickOverall", "height", "weight", "totalMVP"))
+
+z_team_stats <- data.frame()
+for (i in 2023) {
+  df <- bref_teams_stats(seasons = i, assign_to_environment = F)
+  df <- df[[2]][[1]]
+  df <- df %>% select(slugSeason, yearSeason, slugTeamBREF, pctWins, ptsPerGameTeam, astPerGameTeam, drbPerGameTeam, tovPerGameTeam, pctFGPerGameTeam, pctFTPerGameTeam)
+  z_team_stats <- df
+}
+
+#different from training data in that its missing isMVP, award share, year, merge year (hopefully won't matter)
+z_team_player_stats <- left_join(z_full_player_stats_clean, z_team_stats, by=c("slugTeamBREF", "yearSeason"))
+z_team_player_stats <- z_team_player_stats %>% mutate(numberPickOverall = ifelse(is.na(numberPickOverall), 0, numberPickOverall))
+
+#write.csv(z_team_player_stats, "MVP_predictions_2023.csv")
+
+```
+
+# 2022-23 Predictions
+```{r}
+attributes_current <- readxl::read_excel("height_weight_current.xlsx")
+attributes_current <- attributes_current %>%
+  mutate(height = (as.numeric(substr(ht, 1, 1))*12 + as.numeric(word(ht, 2, sep="-"))) * 2.54,
+         weight = wt*0.454) %>%
+  select(-ht, -wt)
+
+z_team_player_stats_full <- left_join(z_team_player_stats, attributes_current, by=c("namePlayer"="Player"))
+z_team_player_stats_full <- z_team_player_stats_full %>%
+  select(-height.x, -weight.x) %>%
+  rename("height" = "height.y", "weight" = "weight.y") %>%
+  filter(!is.na(height))
+
+na_count <- sapply(z_team_player_stats_full, function(y) sum(length(which(is.na(y)))))
+na_count <- data.frame(na_count)
+
+z_team_player_stats_full <- z_team_player_stats_full %>% filter(!is.na(pctWins))
+
+new_preds <- predict(award_share_tuned_mod, newdata = z_team_player_stats_full, type = "raw")
+new_preds <- cbind(z_team_player_stats_full, new_preds)
+new_preds <- new_preds %>% rename("pred" = "...66")
+
+new_preds %>%
+  select(namePlayer, pred, ratioWS, ratioVORP, pctWins, ratioPER) %>%
+  arrange(-pred)
+
+htmlTable(new_preds %>% filter(minutesPerGame > 20) %>% select(namePlayer, pred)%>% arrange(-pred))
+
+```
+
